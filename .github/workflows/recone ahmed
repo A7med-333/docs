@@ -1,0 +1,131 @@
+name: Advanced Subdomain & Vulnerability Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: 'Domain to scan'
+        required: true
+        default: 'example.com'
+  schedule:
+    - cron: '0 6 * * 1'  # Monday 06:00 UTC
+
+env:
+  RESULTS_DIR: results
+  WORKDIR: ${{ github.workspace }}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install packages & Go tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl git wget unzip python3-pip zip
+          export GOPATH=$HOME/go
+          export PATH=$GOPATH/bin:$PATH
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/OWASP/Amass/v3/...@latest || true
+          go install -v github.com/tomnomnom/assetfinder@latest || true
+          go install -v github.com/tomnomnom/waybackurls@latest || true
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install -v github.com/projectdiscovery/dnsx/cmd/dnsx@latest
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          mkdir -p ${{ env.WORKDIR }}/${{ env.RESULTS_DIR }}
+
+      - name: Validate required secrets
+        run: |
+          if [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
+            echo "::error::TELEGRAM_BOT_TOKEN is not set"
+            exit 1
+          fi
+          if [ -z "${{ secrets.TELEGRAM_CHAT_ID }}" ]; then
+            echo "::error::TELEGRAM_CHAT_ID is not set"
+            exit 1
+          fi
+
+      - name: Set DOMAIN
+        id: set_domain
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
+          else
+            echo "DOMAIN=example.com" >> $GITHUB_ENV
+          fi
+          mkdir -p ${{ env.WORKDIR }}/${{ env.RESULTS_DIR }}
+
+      - name: Notify start (Telegram)
+        run: |
+          BOT="https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          CHAT="${{ secrets.TELEGRAM_CHAT_ID }}"
+          TEXT="🔍 *Scan Started*\nDomain: \`${{ env.DOMAIN }}\`\nTrigger: \`${{ github.event_name }}\`"
+          curl -s -X POST "$BOT/sendMessage" -d chat_id="$CHAT" -d parse_mode=Markdown -d text="$TEXT" || true
+
+      - name: Update Nuclei templates
+        run: |
+          nuclei -update-templates || echo "nuclei update failed, continuing"
+
+      - name: Discover subdomains (multi-source)
+        run: |
+          OUT="${{ env.WORKDIR }}/${{ env.RESULTS_DIR }}"
+          domain="${{ env.DOMAIN }}"
+          subfinder -d "$domain" -silent -o "$OUT/subfinder.txt" || true
+          amass enum -d "$domain" -o "$OUT/amass.txt" || true
+          assetfinder --subs-only "$domain" > "$OUT/assetfinder.txt" || true
+          curl -s "https://crt.sh/?q=%25.$domain&output=json" | jq -r '.[].name_value' 2>/dev/null | sed 's/\*\.//g' > "$OUT/crtsh.txt" || true
+          cat "$OUT/"*.txt 2>/dev/null | sort -u > "$OUT/all-subdomains.txt" || true
+          cat "$OUT/all-subdomains.txt" | httpx -silent -o "$OUT/httpx.txt" || true
+          cat "$OUT/all-subdomains.txt" | dnsx -silent -a -resp -o "$OUT/dnsx.txt" || true
+          echo "SUBS_TOTAL=$(wc -l < $OUT/all-subdomains.txt || echo 0)" >> $GITHUB_ENV
+          echo "HTTP_ALIVE=$(wc -l < $OUT/httpx.txt || echo 0)" >> $GITHUB_ENV
+
+      - name: Send discovery results to Telegram
+        run: |
+          BOT="https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          CHAT="${{ secrets.TELEGRAM_CHAT_ID }}"
+          OUT="${{ env.WORKDIR }}/${{ env.RESULTS_DIR }}"
+          TEXT="✅ Discovery for \`${{ env.DOMAIN }}\` — Found: *${{ env.SUBS_TOTAL }}* — HTTP alive: *${{ env.HTTP_ALIVE }}*"
+          curl -s -X POST "$BOT/sendMessage" -d chat_id="$CHAT" -d parse_mode=Markdown -d text="$TEXT" || true
+          if [ -s "$OUT/all-subdomains.txt" ]; then
+            zip -j "$OUT/subdomains_${{ env.DOMAIN }}.zip" "$OUT/all-subdomains.txt"
+            curl -s -F document=@"$OUT/subdomains_${{ env.DOMAIN }}.zip" "$BOT/sendDocument?chat_id=$CHAT&caption=SubdomainsList" || true
+          fi
+
+      - name: Run Nuclei (JSON output)
+        run: |
+          OUT="${{ env.WORKDIR }}/${{ env.RESULTS_DIR }}"
+          INPUT="$OUT/httpx.txt"
+          if [ ! -s "$INPUT" ]; then INPUT="$OUT/all-subdomains.txt"; fi
+          nuclei -l "$INPUT" -severity critical,high,medium -silent -json -o "$OUT/nuclei.json" || true
+          jq -r '. | "\(.host) | \(.info.severity) | \(.info.name)"' "$OUT/nuclei.json" > "$OUT/nuclei-summary.txt" || true
+          echo "VULNS_FOUND=$(jq length "$OUT/nuclei.json" || echo 0)" >> $GITHUB_ENV
+
+      - name: Send Nuclei results to Telegram
+        run: |
+          BOT="https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          CHAT="${{ secrets.TELEGRAM_CHAT_ID }}"
+          OUT="${{ env.WORKDIR }}/${{ env.RESULTS_DIR }}"
+          if [ "${{ env.VULNS_FOUND }}" -gt 0 ]; then
+            curl -s -X POST "$BOT/sendMessage" -d chat_id="$CHAT" -d parse_mode=Markdown -d text="🚨 *Vulnerabilities found*: ${{ env.VULNS_FOUND }} for \`${{ env.DOMAIN }}\`" || true
+            zip -j "$OUT/nuclei_${{ env.DOMAIN }}.zip" "$OUT/nuclei-summary.txt" "$OUT/nuclei.json"
+            curl -s -F document=@"$OUT/nuclei_${{ env.DOMAIN }}.zip" "$BOT/sendDocument?chat_id=$CHAT&caption=NucleiResults" || true
+          else
+            curl -s -X POST "$BOT/sendMessage" -d chat_id="$CHAT" -d parse_mode=Markdown -d text="✅ Nuclei: No critical/high/medium for \`${{ env.DOMAIN }}\`" || true
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results-${{ env.DOMAIN }}-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+
+      - name: Final notification
+        run: |
+          BOT="https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          CHAT="${{ secrets.TELEGRAM_CHAT_ID }}"
+          curl -s -X POST "$BOT/sendMessage" -d chat_id="$CHAT" -d parse_mode=Markdown -d text="🏁 Scan finished for \`${{ env.DOMAIN }}\`. Artifacts uploaded." || true
